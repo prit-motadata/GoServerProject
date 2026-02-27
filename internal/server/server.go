@@ -5,19 +5,39 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/prit-motadata/GoServerProject/internal/models"
 )
 
-const maxBodySize = 1 << 20 // 1MB
+const (
+	maxBodySize = 1 << 20 // 1MB
+	queueSize   = 5
+)
 
 type Server struct {
 	httpServer *http.Server
+	logCh      chan models.Log
+}
+
+func (s *Server) worker() {
+	log.Println("worker started")
+
+	for logEntry := range s.logCh {
+		// simulate processing time
+		time.Sleep(2 * time.Second)
+
+		log.Printf("processed log: %+v\n", logEntry)
+	}
+
+	log.Println("worker stopped")
 }
 
 func New(addr string) *Server {
 	mux := http.NewServeMux()
-	s := &Server{}
+	s := &Server{
+		logCh: make(chan models.Log, queueSize),
+	}
 
 	mux.HandleFunc("/health", s.healthHandler)
 	mux.HandleFunc("/logs", s.logHandler)
@@ -26,6 +46,8 @@ func New(addr string) *Server {
 		Addr:    addr,
 		Handler: mux,
 	}
+
+	go s.worker()
 
 	return s
 }
@@ -77,7 +99,8 @@ func (s *Server) logHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("received log: %+v\n", logEntry)
+	// Push log entry into channel
+	s.logCh <- logEntry
 
 	w.WriteHeader(http.StatusAccepted)
 }
