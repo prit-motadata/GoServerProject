@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -18,9 +20,11 @@ const (
 )
 
 type Server struct {
-	httpServer *http.Server
-	logCh      chan models.Log
-	metrics    *Metrics
+	httpServer    *http.Server
+	logCh         chan models.Log
+	metrics       *Metrics
+	limiter       *RateLimiter
+	limiterCancel context.CancelFunc
 
 	workerCount int
 	wg          sync.WaitGroup
@@ -67,12 +71,13 @@ func New(addr string) *Server {
 	s := &Server{
 		logCh:       make(chan models.Log, queueSize),
 		metrics:     NewMetrics(),
+		limiter:     NewRateLimiter(2, 5, 1*time.Minute), // 2 req/s, burst 5
 		workerCount: 3,
 	}
 
-	mux.HandleFunc("/health", s.healthHandler)
-	mux.HandleFunc("/logs", s.logHandler)
-	mux.HandleFunc("/metrics", s.metricsHandler)
+	mux.Handle("/health", s.rateLimitMiddleware(http.HandlerFunc(s.healthHandler)))
+	mux.Handle("/logs", s.rateLimitMiddleware(http.HandlerFunc(s.logHandler)))
+	mux.Handle("/metrics", s.rateLimitMiddleware(http.HandlerFunc(s.metricsHandler)))
 
 	s.httpServer = &http.Server{
 		Addr:    addr,
@@ -81,12 +86,17 @@ func New(addr string) *Server {
 
 	s.startWorkers()
 
+	// Start limiter cleanup
+	ctx, cancel := context.WithCancel(context.Background())
+	s.limiterCancel = cancel
+	go s.limiter.StartCleanup(ctx, 30*time.Second)
+
 	return s
 }
 
 func (s *Server) Start() error {
 	log.Printf("server starting on %s", s.httpServer.Addr)
-	if err := s.httpServer.ListenAndServe(); err != http.ErrServerClosed {
+	if err := s.httpServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
@@ -103,7 +113,27 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.wg.Wait()
 	log.Println("Workers finished.")
 
+	if s.limiterCancel != nil {
+		s.limiterCancel()
+	}
+
 	return err
+}
+
+func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			ip = r.RemoteAddr
+		}
+
+		if !s.limiter.Allow(ip) {
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
