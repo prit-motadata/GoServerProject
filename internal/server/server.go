@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -80,7 +81,24 @@ func New(addr string) *Server {
 
 func (s *Server) Start() error {
 	log.Printf("server starting on %s", s.httpServer.Addr)
-	return s.httpServer.ListenAndServe()
+	if err := s.httpServer.ListenAndServe(); err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	log.Println("Shutting down HTTP server...")
+	err := s.httpServer.Shutdown(ctx)
+
+	log.Println("Closing log channel...")
+	close(s.logCh)
+
+	log.Println("Waiting for workers to finish...")
+	s.wg.Wait()
+	log.Println("Workers finished.")
+
+	return err
 }
 
 func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
