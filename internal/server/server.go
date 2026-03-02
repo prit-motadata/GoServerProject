@@ -19,12 +19,32 @@ const (
 	queueSize   = 5
 )
 
+type BackpressureStrategy int
+
+const (
+	StrategyBlock BackpressureStrategy = iota
+	StrategyDrop
+	StrategyReject
+)
+
+func (s BackpressureStrategy) String() string {
+	switch s {
+	case StrategyDrop:
+		return "DROP"
+	case StrategyReject:
+		return "REJECT"
+	default:
+		return "BLOCK"
+	}
+}
+
 type Server struct {
 	httpServer    *http.Server
 	logCh         chan models.Log
 	metrics       *Metrics
 	limiter       *RateLimiter
 	limiterCancel context.CancelFunc
+	strategy      BackpressureStrategy
 
 	workerCount int
 	wg          sync.WaitGroup
@@ -66,12 +86,13 @@ func (s *Server) startWorkers() {
 	}
 }
 
-func New(addr string) *Server {
+func New(addr string, strategy BackpressureStrategy, rate, burst float64) *Server {
 	mux := http.NewServeMux()
 	s := &Server{
 		logCh:       make(chan models.Log, queueSize),
 		metrics:     NewMetrics(),
-		limiter:     NewRateLimiter(2, 5, 1*time.Minute), // 2 req/s, burst 5
+		limiter:     NewRateLimiter(rate, burst, 1*time.Minute),
+		strategy:    strategy,
 		workerCount: 3,
 	}
 
@@ -95,7 +116,7 @@ func New(addr string) *Server {
 }
 
 func (s *Server) Start() error {
-	log.Printf("server starting on %s", s.httpServer.Addr)
+	log.Printf("server starting on %s (Backpressure: %s)", s.httpServer.Addr, s.strategy)
 	if err := s.httpServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -178,10 +199,28 @@ func (s *Server) logHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Push log entry into channel
-	s.logCh <- logEntry
-
-	w.WriteHeader(http.StatusAccepted)
+	// Push log entry into channel based on strategy
+	switch s.strategy {
+	case StrategyDrop:
+		select {
+		case s.logCh <- logEntry:
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			s.metrics.RecordDrop()
+			w.WriteHeader(http.StatusAccepted) // Silently drop
+		}
+	case StrategyReject:
+		select {
+		case s.logCh <- logEntry:
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			s.metrics.RecordDrop()
+			http.Error(w, "server busy, try again later", http.StatusTooManyRequests)
+		}
+	default: // StrategyBlock
+		s.logCh <- logEntry
+		w.WriteHeader(http.StatusAccepted)
+	}
 }
 
 func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {

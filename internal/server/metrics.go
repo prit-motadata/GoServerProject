@@ -10,6 +10,7 @@ type Metrics struct {
 	mu           sync.RWMutex
 	TotalLogs    uint64            `json:"total_logs"`
 	ErrorLogs    uint64            `json:"error_logs"`
+	DroppedLogs  uint64            `json:"dropped_logs"`
 	ServiceStats map[string]uint64 `json:"service_stats"`
 }
 
@@ -30,9 +31,16 @@ func (m *Metrics) Record(level models.LogLevel, service string) {
 	m.ServiceStats[service]++
 }
 
+func (m *Metrics) RecordDrop() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.DroppedLogs++
+}
+
 type MetricsSnapshot struct {
 	TotalLogs    uint64            `json:"total_logs"`
 	ErrorLogs    uint64            `json:"error_logs"`
+	DroppedLogs  uint64            `json:"dropped_logs"`
 	ServiceStats map[string]uint64 `json:"service_stats"`
 }
 
@@ -49,6 +57,7 @@ func (m *Metrics) GetSnapshot() MetricsSnapshot {
 	return MetricsSnapshot{
 		TotalLogs:    m.TotalLogs,
 		ErrorLogs:    m.ErrorLogs,
+		DroppedLogs:  m.DroppedLogs,
 		ServiceStats: stats,
 	}
 }
