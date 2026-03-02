@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/prit-motadata/GoServerProject/internal/models"
@@ -18,25 +19,50 @@ const (
 type Server struct {
 	httpServer *http.Server
 	logCh      chan models.Log
+
+	workerCount int
+	wg          sync.WaitGroup
 }
 
-func (s *Server) worker() {
-	log.Println("worker started")
+func (s *Server) worker(id int) {
+	log.Printf("worker %d started\n", id)
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("worker %d recovered from panic: %v\n", id, r)
+		}
+		log.Printf("worker %d stopped\n", id)
+	}()
 
 	for logEntry := range s.logCh {
-		// simulate processing time
+
+		// Simulate occasional panic
+		if logEntry.Message == "panic" {
+			panic("simulated worker panic")
+		}
+
 		time.Sleep(2 * time.Second)
 
-		log.Printf("processed log: %+v\n", logEntry)
+		log.Printf("worker %d processed: %+v\n", id, logEntry)
 	}
+}
 
-	log.Println("worker stopped")
+func (s *Server) startWorkers() {
+	for i := 0; i < s.workerCount; i++ {
+		s.wg.Add(1)
+
+		go func(id int) {
+			defer s.wg.Done()
+			s.worker(id)
+		}(i)
+	}
 }
 
 func New(addr string) *Server {
 	mux := http.NewServeMux()
 	s := &Server{
-		logCh: make(chan models.Log, queueSize),
+		logCh:       make(chan models.Log, queueSize),
+		workerCount: 3,
 	}
 
 	mux.HandleFunc("/health", s.healthHandler)
@@ -47,7 +73,7 @@ func New(addr string) *Server {
 		Handler: mux,
 	}
 
-	go s.worker()
+	s.startWorkers()
 
 	return s
 }
