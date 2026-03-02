@@ -8,7 +8,7 @@ import (
 
 type Log struct {
 	Service   string    `json:"service"`
-	Level     string    `json:"level"`
+	Level     LogLevel  `json:"level"`
 	Message   string    `json:"message"`
 	Timestamp time.Time `json:"timestamp"`
 }
@@ -21,9 +21,7 @@ func (l *Log) Validate() error {
 		return errors.New("message is required")
 	}
 
-	switch l.Level {
-	case "INFO", "WARN", "ERROR":
-	default:
+	if !l.Level.IsValid() {
 		return errors.New("invalid level")
 	}
 

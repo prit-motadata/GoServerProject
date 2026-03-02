@@ -20,6 +20,7 @@ const (
 type Server struct {
 	httpServer *http.Server
 	logCh      chan models.Log
+	metrics    *Metrics
 
 	workerCount int
 	wg          sync.WaitGroup
@@ -44,6 +45,8 @@ func (s *Server) worker(id int) {
 
 		time.Sleep(2 * time.Second)
 
+		s.metrics.Record(logEntry.Level, logEntry.Service)
+
 		log.Printf("worker %d processed: %+v\n", id, logEntry)
 	}
 }
@@ -63,11 +66,13 @@ func New(addr string) *Server {
 	mux := http.NewServeMux()
 	s := &Server{
 		logCh:       make(chan models.Log, queueSize),
+		metrics:     NewMetrics(),
 		workerCount: 3,
 	}
 
 	mux.HandleFunc("/health", s.healthHandler)
 	mux.HandleFunc("/logs", s.logHandler)
+	mux.HandleFunc("/metrics", s.metricsHandler)
 
 	s.httpServer = &http.Server{
 		Addr:    addr,
@@ -147,4 +152,19 @@ func (s *Server) logHandler(w http.ResponseWriter, r *http.Request) {
 	s.logCh <- logEntry
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	metrics := s.metrics.GetSnapshot()
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(metrics); err != nil {
+		http.Error(w, "error encoding metrics", http.StatusInternalServerError)
+		return
+	}
 }
