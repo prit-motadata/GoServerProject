@@ -5,7 +5,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -19,36 +18,13 @@ func main() {
 		log.Println("No .env file found, using system environment variables")
 	}
 
-	addr := getEnv("SERVER_ADDR", ":8080")
-	strategyStr := getEnv("BACKPRESSURE_STRATEGY", "block")
-
-	var strategy server.BackpressureStrategy
-	switch strategyStr {
-	case "drop":
-		strategy = server.StrategyDrop
-	case "reject":
-		strategy = server.StrategyReject
-	default:
-		strategy = server.StrategyBlock
-	}
-
-	rateStr := getEnv("RATE_LIMIT", "2")
-	burstStr := getEnv("RATE_BURST", "5")
-
-	rate, _ := strconv.ParseFloat(rateStr, 64)
-	if rate == 0 {
-		rate = 2
-	}
-	burst, _ := strconv.ParseFloat(burstStr, 64)
-	if burst == 0 {
-		burst = 5
-	}
+	cfg := server.ConfigFromEnv()
 
 	// Set up signal handling
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	s := server.New(addr, strategy, rate, burst)
+	s := server.New(cfg)
 
 	// Start server in a separate goroutine
 	errChan := make(chan error, 1)
@@ -76,12 +52,4 @@ func main() {
 	}
 
 	log.Println("Graceful shutdown finished successfully.")
-}
-
-func getEnv(key, fallback string) string {
-	value := os.Getenv(key)
-	if value == "" {
-		return fallback
-	}
-	return value
 }

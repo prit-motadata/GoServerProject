@@ -2,21 +2,12 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"log"
-	"net"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/prit-motadata/GoServerProject/internal/models"
-)
-
-const (
-	maxBodySize = 1 << 20 // 1MB
-	queueSize   = 5
 )
 
 type BackpressureStrategy int
@@ -39,73 +30,42 @@ func (s BackpressureStrategy) String() string {
 }
 
 type Server struct {
+	config        *Config
 	httpServer    *http.Server
 	logCh         chan models.Log
 	metrics       *Metrics
 	limiter       *RateLimiter
 	limiterCancel context.CancelFunc
-	strategy      BackpressureStrategy
-
-	workerCount int
-	wg          sync.WaitGroup
+	workerPool    *WorkerPool
 }
 
-func (s *Server) worker(id int) {
-	log.Printf("worker %d started\n", id)
-
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("worker %d recovered from panic: %v\n", id, r)
-		}
-		log.Printf("worker %d stopped\n", id)
-	}()
-
-	for logEntry := range s.logCh {
-
-		// Simulate occasional panic
-		if logEntry.Message == "panic" {
-			panic("simulated worker panic")
-		}
-
-		time.Sleep(2 * time.Second)
-
-		s.metrics.Record(logEntry.Level, logEntry.Service)
-
-		log.Printf("worker %d processed: %+v\n", id, logEntry)
+func New(cfg *Config) *Server {
+	if cfg == nil {
+		cfg = DefaultConfig()
 	}
-}
 
-func (s *Server) startWorkers() {
-	for i := 0; i < s.workerCount; i++ {
-		s.wg.Add(1)
+	logCh := make(chan models.Log, cfg.QueueSize)
+	metrics := NewMetrics()
 
-		go func(id int) {
-			defer s.wg.Done()
-			s.worker(id)
-		}(i)
-	}
-}
-
-func New(addr string, strategy BackpressureStrategy, rate, burst float64) *Server {
-	mux := http.NewServeMux()
 	s := &Server{
-		logCh:       make(chan models.Log, queueSize),
-		metrics:     NewMetrics(),
-		limiter:     NewRateLimiter(rate, burst, 1*time.Minute),
-		strategy:    strategy,
-		workerCount: 3,
+		config:     cfg,
+		logCh:      logCh,
+		metrics:    metrics,
+		limiter:    NewRateLimiter(cfg.RateLimit, cfg.RateBurst, cfg.IdleTimeout),
+		workerPool: NewWorkerPool(logCh, metrics, cfg.WorkerCount),
 	}
 
+	mux := http.NewServeMux()
 	mux.Handle("/health", s.rateLimitMiddleware(http.HandlerFunc(s.healthHandler)))
 	mux.Handle("/logs", s.rateLimitMiddleware(http.HandlerFunc(s.logHandler)))
 	mux.Handle("/metrics", s.rateLimitMiddleware(http.HandlerFunc(s.metricsHandler)))
 
 	s.httpServer = &http.Server{
-		Addr:    addr,
+		Addr:    cfg.Addr,
 		Handler: mux,
 	}
 
-	s.startWorkers()
+	s.workerPool.Start()
 
 	// Start limiter cleanup
 	ctx, cancel := context.WithCancel(context.Background())
@@ -116,7 +76,7 @@ func New(addr string, strategy BackpressureStrategy, rate, burst float64) *Serve
 }
 
 func (s *Server) Start() error {
-	log.Printf("server starting on %s (Backpressure: %s)", s.httpServer.Addr, s.strategy)
+	log.Printf("server starting on %s (Backpressure: %s)", s.config.Addr, s.config.BackpressureStrategy)
 	if err := s.httpServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -131,7 +91,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	close(s.logCh)
 
 	log.Println("Waiting for workers to finish...")
-	s.wg.Wait()
+	s.workerPool.Stop()
 	log.Println("Workers finished.")
 
 	if s.limiterCancel != nil {
@@ -139,101 +99,4 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	return err
-}
-
-func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			ip = r.RemoteAddr
-		}
-
-		if !s.limiter.Allow(ip) {
-			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok"))
-}
-
-func (s *Server) logHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Prevent large payload attacks
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
-
-	defer func() {
-		// ensure body fully drained to allow connection reuse
-		_, _ = io.Copy(io.Discard, r.Body)
-		err := r.Body.Close()
-		if err != nil {
-			return
-		}
-	}()
-
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-
-	var logEntry models.Log
-	if err := decoder.Decode(&logEntry); err != nil {
-		http.Error(w, "invalid JSON payload", http.StatusBadRequest)
-		return
-	}
-
-	if err := logEntry.Validate(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Push log entry into channel based on strategy
-	switch s.strategy {
-	case StrategyDrop:
-		select {
-		case s.logCh <- logEntry:
-			w.WriteHeader(http.StatusAccepted)
-		default:
-			s.metrics.RecordDrop()
-			w.WriteHeader(http.StatusAccepted) // Silently drop
-		}
-	case StrategyReject:
-		select {
-		case s.logCh <- logEntry:
-			w.WriteHeader(http.StatusAccepted)
-		default:
-			s.metrics.RecordDrop()
-			http.Error(w, "server busy, try again later", http.StatusTooManyRequests)
-		}
-	default: // StrategyBlock
-		s.logCh <- logEntry
-		w.WriteHeader(http.StatusAccepted)
-	}
-}
-
-func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	metrics := s.metrics.GetSnapshot()
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(metrics); err != nil {
-		http.Error(w, "error encoding metrics", http.StatusInternalServerError)
-		return
-	}
 }
