@@ -16,6 +16,8 @@ type Config struct {
 	WorkerCount          int
 	MaxBodySize          int64
 	QueueSize            int
+	EnablePprof          bool
+	PprofAddr            string
 }
 
 // DefaultConfig returns a configuration with default values.
@@ -29,6 +31,8 @@ func DefaultConfig() *Config {
 		WorkerCount:          3,
 		MaxBodySize:          1 << 20, // 1MB
 		QueueSize:            5,
+		EnablePprof:          true,
+		PprofAddr:            ":6060",
 	}
 }
 
@@ -67,6 +71,15 @@ func ConfigFromEnv() *Config {
 		if w, err := strconv.Atoi(workers); err == nil && w > 0 {
 			cfg.WorkerCount = w
 		}
+	}
+	if pprof := os.Getenv("ENABLE_PPROF"); pprof != "" {
+		if b, err := strconv.ParseBool(pprof); err == nil {
+			cfg.EnablePprof = b
+		}
+	}
+
+	if pprofAddr := os.Getenv("PPROF_ADDR"); pprofAddr != "" {
+		cfg.PprofAddr = pprofAddr
 	}
 
 	return cfg
